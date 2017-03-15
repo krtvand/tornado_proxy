@@ -13,6 +13,13 @@ import tornado.httpclient
 import tornado.httputil
 
 
+MAP = {
+    '127.0.0.1:77': {x for x in range(7700, 7799)},
+    '127.0.0.1:78': {x for x in range(7800, 7899)}
+}
+DEFAULT_DESTINATION = '127.0.0.1:77'
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter(u'%(levelname)-8s [%(asctime)s]  %(message)s')
@@ -23,40 +30,65 @@ logger.addHandler(console_handler)
 
 __all__ = ['ProxyHandler', 'run_proxy']
 
-
-def parse_json_body(body):
-    body_obj = json.loads(body)
-    return body_obj['menu']['port']
-
-def make_client_request(server_request):
-    kwargs = {}
-    port = parse_json_body(server_request.body)
-    endpoint_netloc = ':'.join(['127.0.0.1', port])
-
-    url = urlunparse([server_request.protocol, endpoint_netloc,
-                      server_request.path, server_request.query, None, None])
-    kwargs['method'] = server_request.method
-    kwargs['headers'] = server_request.headers
-    if server_request.body:
-        kwargs['body'] = server_request.body
-    else:
-        kwargs['body'] = None
-
-    client_req = tornado.httpclient.HTTPRequest(url, **kwargs)
-    return client_req
+class ProxyException(Exception):
+    pass
 
 
 def fetch_request(client_request, callback, **kwargs):
-
     client = tornado.httpclient.AsyncHTTPClient()
     client.fetch(client_request, callback, raise_error=False)
 
 
 class ProxyHandler(tornado.web.RequestHandler):
-    SUPPORTED_METHODS = ['GET', 'POST', 'CONNECT']
+    SUPPORTED_METHODS = ['GET', 'POST']
 
     def compute_etag(self):
         return None  # disable tornado Etag
+
+    def get_field_from_json_body(self, body, field_name):
+        body_obj = json.loads(body.decode('utf-8'))
+        if field_name in body_obj:
+            return body_obj[field_name]
+        else:
+            raise ProxyException(
+                '{} field not found in requests json body'.format(field_name))
+
+    def find_dest_host_by_term_id(self, terminal_id):
+        for dest in MAP:
+            if terminal_id in MAP[dest]:
+                destination = dest
+                break
+        else:
+            destination = DEFAULT_DESTINATION
+        return destination
+
+    def get_dest_host(self, server_request):
+        if 'content-type' in server_request.headers:
+            if server_request.headers['content-type'] == 'application/json':
+                terminal_id = self.get_field_from_json_body(server_request.body, 'terminal_id')
+                return self.find_dest_host_by_term_id(terminal_id)
+            else:
+                raise ProxyException('Content-type should be application/json')
+        else:
+            raise ProxyException('Content-type header not found')
+
+    def make_client_request(self, server_request):
+        kwargs = {}
+        dest_host = self.get_dest_host(server_request)
+        url = urlunparse(
+            [server_request.protocol, dest_host,
+             server_request.path, server_request.query,
+             None, None]
+        )
+        kwargs['method'] = server_request.method
+        kwargs['headers'] = server_request.headers
+        if server_request.body:
+            kwargs['body'] = server_request.body
+        else:
+            kwargs['body'] = None
+
+        client_req = tornado.httpclient.HTTPRequest(url, **kwargs)
+        return client_req
 
     @tornado.web.asynchronous
     def get(self):
@@ -81,11 +113,10 @@ class ProxyHandler(tornado.web.RequestHandler):
                     self.write(response.body)
             self.finish()
 
-        client_request = make_client_request(self.request)
-
         try:
+            client_request = self.make_client_request(self.request)
             fetch_request(client_request, handle_response)
-        except tornado.httpclient.HTTPError as e:
+        except (tornado.httpclient.HTTPError, ProxyException) as e:
             if hasattr(e, 'response') and e.response:
                 handle_response(e.response)
             else:
@@ -113,8 +144,6 @@ def run_proxy(port, start_ioloop=True):
 
 if __name__ == '__main__':
     port = 88
-    if len(sys.argv) > 1:
-        port = int(sys.argv[1])
 
     print("Starting HTTP proxy on port %d" % port)
     run_proxy(port)
